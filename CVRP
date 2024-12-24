@@ -1,0 +1,225 @@
+%pip install pulp
+%pip install matplotlip
+%pip install folium
+%pip install requests
+
+import numpy as np
+import pandas as pd
+import pulp
+import itertools
+from matplotlib import pyplot as plt
+import folium
+
+
+# customer count ('0' is depot) 
+customer_count = 14
+
+# the number of vehicle
+vehicle_count = 50000
+
+# the capacity of vehicle
+vehicle_capacity = 70
+
+# fix random seed
+np.random.seed(seed=999)
+
+
+"""
+READING FILE
+"""
+# df = pd.read_csv(r'vrpdata.txt', sep = " ")
+
+df= spark.read.csv("dbfs:/FileStore/tables/COG/TEST_1/VRP_Test_IN.csv", header=True)
+
+df = df.toPandas()
+# Converting columns to numeric types
+df["X"] = pd.to_numeric(df["X"])
+df["Y"] = pd.to_numeric(df["Y"])
+df["Demand"] = pd.to_numeric(df["Demand"])
+
+df = df.iloc[0:customer_count+1]
+
+Y, X = list(df["Y"]), list(df["X"])
+coordinates = np.column_stack((X, Y))
+
+Demand = list(df["Demand"])
+n = len(coordinates)
+depot, customers = coordinates[0, :], coordinates[1:, :]
+M = 100**100 #Random Large Number
+CF= 1.0 # Define circulrity factor
+max_route_distance = 10
+
+
+## Calculating distance between two clients
+"""
+Parameters: Dataframe
+Returns: Distance Results
+"""
+def _distance_calculator(_df):
+    
+    _distance_result = np.zeros((len(_df),len(_df)))
+    _df['X-Y'] = '0'
+
+    for i in range(len(_df)):
+        for j in range(len(_df)):
+            
+            # calculate distance of all pairs
+            '''variable_1: X[i,j] =(0,1), i,j = Nodes'''
+            #x[i, j] = m.addVar(vtype=GRB.BINARY, name="x%d,%d" % (i, j))
+            _distance_result[i, j] = (np.sqrt((X[i] - X[j]) ** 2 + (Y[i] - Y[j]) ** 2))*CF
+            if i == j:
+                _distance_result[i, j] = M  ## big 'M'
+            continue
+    return _distance_result
+
+distance = _distance_calculator(df)
+
+
+## Running PULP algorithm for results
+for vehicle_count in range(1,vehicle_count+1):
+    
+    # definition of LpProblem instance
+    problem = pulp.LpProblem("CVRP", pulp.LpMinimize)
+
+    # definition of variables which are 0/1
+    x = [[[pulp.LpVariable("x%s_%s,%s"%(i,j,k), cat="Binary") if i != j else None for k in range(vehicle_count)]for j in range(customer_count)] for i in range(customer_count)]
+
+    # add objective function
+    problem += pulp.lpSum(distance[i][j] * x[i][j][k] if i != j else 0
+                          for k in range(vehicle_count) 
+                          for j in range(customer_count) 
+                          for i in range (customer_count))
+
+    # constraints
+    # forluma (2)
+    for j in range(1, customer_count):
+        problem += pulp.lpSum(x[i][j][k] if i != j else 0 
+                              for i in range(customer_count) 
+                              for k in range(vehicle_count)) == 1 
+
+    # forluma (3)
+    for k in range(vehicle_count):
+        problem += pulp.lpSum(x[0][j][k] for j in range(1,customer_count)) == 1
+        problem += pulp.lpSum(x[i][0][k] for i in range(1,customer_count)) == 1
+
+    # forluma (4)
+    for k in range(vehicle_count):
+        for j in range(customer_count):
+            problem += pulp.lpSum(x[i][j][k] if i != j else 0 
+                                  for i in range(customer_count)) -  pulp.lpSum(x[j][i][k] for i in range(customer_count)) == 0
+
+    #forluma (5)
+    for k in range(vehicle_count):
+        problem += pulp.lpSum(df.Demand[j] * x[i][j][k] if i != j else 0 for i in range(customer_count) for j in range (1,customer_count)) <= vehicle_capacity
+
+
+    #formula (6)
+    subtours = []
+    for i in range(2,customer_count):
+         subtours += itertools.combinations(range(1,customer_count), i)
+
+    for s in subtours:
+        problem += pulp.lpSum(x[i][j][k] if i !=j else 0 for i, j in itertools.permutations(s,2) for k in range(vehicle_count)) <= len(s) - 1
+
+    
+# Adding the maximum distance constraint for each vehicle
+    for k in range(vehicle_count):
+        problem += pulp.lpSum(distance[i][j] * x[i][j][k] if i != j else 0
+                              for i in range(customer_count)
+                              for j in range(customer_count)) <= max_route_distance
+
+
+    # print vehicle_count which needed for solving problem
+    # print calculated minimum distance value
+    if problem.solve() == 1:
+        print('Vehicle Requirements:', vehicle_count)
+        print('Moving Distance:', pulp.value(problem.objective))
+        break
+
+import matplotlib.pyplot as plt
+import itertools
+
+# Assuming the previous code is already executed and the problem is solved
+
+# Extract the routes from the solution
+routes = []
+for k in range(vehicle_count):
+    route = []
+    for i in range(customer_count):
+        for j in range(customer_count):
+            if i != j and pulp.value(x[i][j][k]) == 1:
+                route.append((i, j))
+    routes.append(route)
+
+# Create a DataFrame to display the routes
+route_df = pd.DataFrame(columns=['Vehicle', 'From', 'To'])
+for k, route in enumerate(routes):
+    for (i, j) in route:
+        route_df = route_df.append({'Vehicle': k+1, 'From': i, 'To': j}, ignore_index=True)
+
+display(route_df)
+
+
+# Visualization of Results
+plt.figure(figsize=(8,8))
+for i in range(customer_count):    
+    if i == 0:
+        plt.scatter(df.X[i], df.Y[i], c='green', s=200, label='Depot')
+    else:
+        plt.scatter(df.X[i], df.Y[i], c='blue', s=100, label='Customer' if i == 1 else "")
+
+colors = ['r', 'g', 'b', 'y', 'c', 'm']
+for k, route in enumerate(routes):
+    for (i, j) in route:
+        plt.plot([df.X[i], df.X[j]], [df.Y[i], df.Y[j]], c=colors[k % len(colors)], label=f'Vehicle {k+1}' if i == 0 else "")
+
+plt.xlabel('X Coordinate')
+plt.ylabel('Y Coordinate')
+plt.title('Vehicle Routing Problem Solution')
+plt.legend()
+plt.show()
+
+
+%pip install folium
+import folium
+
+
+# Visualization on real map using Folium
+map_center = [np.mean(Y), np.mean(X)]
+route_map = folium.Map(location=map_center, zoom_start=13)
+
+for i in range(customer_count):
+    if i == 0:
+        folium.Marker([Y[i], X[i]], popup='Depot', icon=folium.Icon(color='green')).add_to(route_map)
+    else:
+        folium.Marker([Y[i], X[i]], popup=f'Customer {i}', icon=folium.Icon(color='blue')).add_to(route_map)
+
+colors = ['red', 'green', 'blue', 'yellow', 'cyan', 'magenta']
+for k, route in enumerate(routes):
+    for (i, j) in route:
+        folium.PolyLine(locations=[[Y[i], X[i]], [Y[j], X[j]]], color=colors[k % len(colors)], weight=5).add_to(route_map)
+
+route_map.save("vehicle_routing_map.html")
+route_map
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
